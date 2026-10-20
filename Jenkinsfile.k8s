@@ -1,10 +1,10 @@
 @Library('sre-global') _
 // MP-1196: prod tag pushed only from master (and manual builds). A PR build pushes
 // the commit tag and does not move v1.6.69.
-// HelmReleases pull artifactory.outbrain.com:5005/opsvisibility/elasticsearch-exporter.
-// pushToArtifactory keeps that registry in sync; buildTarget aws also pushes ECR,
-// which nvdc1d pulls directly. The next change must bump version or it overwrites
-// this tag.
+// Push lands on artifactorymaster.outbrain.com:5005/opsvisibility/elasticsearch-exporter.
+// HelmReleases pull that path from artifactory.outbrain.com. pushToArtifactory is
+// required for those pulls; buildTarget aws also pushes ECR for nvdc1d.
+// The next change must bump version or it overwrites this tag.
 simpleDocker([
   baseImageName: 'opsvisibility/elasticsearch-exporter',
   artifactoryUrl: 'artifactorymaster.outbrain.com:5005',
