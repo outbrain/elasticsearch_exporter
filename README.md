@@ -233,6 +233,7 @@ Further Information
 | elasticsearch_snapshot_stats_snapshot_end_time_timestamp             | gauge      | 1           | Last snapshot end timestamp                                                                         |
 | elasticsearch_snapshot_stats_snapshot_number_of_failures             | gauge      | 1           | Last snapshot number of failures                                                                    |
 | elasticsearch_snapshot_stats_snapshot_number_of_indices              | gauge      | 1           | Last snapshot number of indices                                                                     |
+| elasticsearch_snapshot_stats_snapshot_size_bytes                     | gauge      | snapshots   | Total size of each snapshot in bytes                                                                |
 | elasticsearch_snapshot_stats_snapshot_failed_shards                  | gauge      | 1           | Last snapshot failed shards                                                                         |
 | elasticsearch_snapshot_stats_snapshot_successful_shards              | gauge      | 1           | Last snapshot successful shards                                                                     |
 | elasticsearch_snapshot_stats_snapshot_total_shards                   | gauge      | 1           | Last snapshot total shard                                                                           |

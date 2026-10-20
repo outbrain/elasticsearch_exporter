@@ -88,6 +88,11 @@ var (
 		"Timestamp of the latest SUCCESS or PARTIAL snapshot",
 		defaultSnapshotRepositoryLabels, nil,
 	)
+	snapshotSizeBytes = prometheus.NewDesc(
+		prometheus.BuildFQName(namespace, "snapshot_stats", "snapshot_size_bytes"),
+		"Total size of each snapshot in bytes",
+		[]string{"repository", "snapshot"}, nil,
+	)
 )
 
 func init() {
@@ -113,6 +118,7 @@ func NewSnapshots(logger *slog.Logger, u *url.URL, hc *http.Client) (Collector, 
 func (c *Snapshots) Update(ctx context.Context, ch chan<- prometheus.Metric) error {
 	// indices
 	snapshotsStatsResp := make(map[string]SnapshotStatsResponse)
+	snapshotStatuses := make(map[string]SnapshotStatusResponse)
 	u := c.u.ResolveReference(&url.URL{Path: "/_snapshot"})
 
 	var srr SnapshotRepositoriesResponse
@@ -139,6 +145,17 @@ func (c *Snapshots) Update(ctx context.Context, ch chan<- prometheus.Metric) err
 			return fmt.Errorf("failed to unmarshal JSON: %v", err)
 		}
 		snapshotsStatsResp[repository] = ssr
+
+		status, err := c.snapshotStatus(ctx, repository)
+		if err != nil {
+			c.logger.Warn(
+				"failed to fetch snapshot status",
+				"repository", repository,
+				"err", err,
+			)
+			continue
+		}
+		snapshotStatuses[repository] = status
 	}
 
 	// Snapshots stats
@@ -176,6 +193,15 @@ func (c *Snapshots) Update(ctx context.Context, ch chan<- prometheus.Metric) err
 			latest,
 			defaultSnapshotRepositoryLabelValues(repositoryName)...,
 		)
+
+		for _, snap := range snapshotStatuses[repositoryName].Snapshots {
+			ch <- prometheus.MustNewConstMetric(
+				snapshotSizeBytes,
+				prometheus.GaugeValue,
+				float64(snap.Stats.Total.SizeInBytes),
+				repositoryName, snap.Snapshot,
+			)
+		}
 
 		if len(snapshotStats.Snapshots) == 0 {
 			continue
@@ -227,4 +253,26 @@ func (c *Snapshots) Update(ctx context.Context, ch chan<- prometheus.Metric) err
 	}
 
 	return nil
+}
+
+// snapshotStatus reads each snapshot's stored size from the snapshot status API.
+// filter_path limits the response to snapshot name and total size. Elasticsearch still
+// reads shard metadata in the repository to build that response.
+func (c *Snapshots) snapshotStatus(ctx context.Context, repository string) (SnapshotStatusResponse, error) {
+	var status SnapshotStatusResponse
+	u := c.u.ResolveReference(&url.URL{
+		Path: path.Join("/_snapshot", repository, "_all", "_status"),
+		RawQuery: url.Values{
+			"filter_path": []string{"snapshots.snapshot,snapshots.stats.total.size_in_bytes"},
+		}.Encode(),
+	})
+
+	resp, err := getURL(ctx, c.hc, c.logger, u.String())
+	if err != nil {
+		return status, err
+	}
+	if err := json.Unmarshal(resp, &status); err != nil {
+		return status, fmt.Errorf("failed to unmarshal snapshot status JSON: %v", err)
+	}
+	return status, nil
 }

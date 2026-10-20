@@ -7,6 +7,7 @@ The flag `--es.ilm` has been renamed to `--collector.ilm`.
 
 * [CHANGE] Rename --es.data_stream to --collector.data-stream #983
 * [CHANGE] Rename --es.ilm to --collector.ilm #999
+* [FEATURE] Add elasticsearch_snapshot_stats_snapshot_size_bytes metric
 
 ## 1.9.0 / 2025-02-27
 

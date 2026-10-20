@@ -45,3 +45,19 @@ type SnapshotStatDataResponse struct {
 type SnapshotRepositoriesResponse map[string]struct {
 	Type string `json:"type"`
 }
+
+// SnapshotStatusResponse is a representation of the snapshot status API.
+// Only the fields required for snapshot size are decoded; index-level status is omitted.
+type SnapshotStatusResponse struct {
+	Snapshots []SnapshotStatus `json:"snapshots"`
+}
+
+// SnapshotStatus is the status of a single snapshot, including its stored size.
+type SnapshotStatus struct {
+	Snapshot string `json:"snapshot"`
+	Stats    struct {
+		Total struct {
+			SizeInBytes int64 `json:"size_in_bytes"`
+		} `json:"total"`
+	} `json:"stats"`
+}
