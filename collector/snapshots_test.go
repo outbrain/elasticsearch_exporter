@@ -70,6 +70,9 @@ func TestSnapshots(t *testing.T) {
 						# HELP elasticsearch_snapshot_stats_snapshot_number_of_indices Number of indices in the last snapshot
 						# TYPE elasticsearch_snapshot_stats_snapshot_number_of_indices gauge
 						elasticsearch_snapshot_stats_snapshot_number_of_indices{repository="test1",state="SUCCESS",version="1.7.6"} 2
+						# HELP elasticsearch_snapshot_stats_snapshot_size_bytes Total size of each snapshot in bytes
+						# TYPE elasticsearch_snapshot_stats_snapshot_size_bytes gauge
+						elasticsearch_snapshot_stats_snapshot_size_bytes{repository="test1",snapshot="snapshot_1"} 6024
 						# HELP elasticsearch_snapshot_stats_snapshot_start_time_timestamp Last snapshot start timestamp
 						# TYPE elasticsearch_snapshot_stats_snapshot_start_time_timestamp gauge
 						elasticsearch_snapshot_stats_snapshot_start_time_timestamp{repository="test1",state="SUCCESS",version="1.7.6"} 1.536052142e+09
@@ -105,6 +108,9 @@ func TestSnapshots(t *testing.T) {
 						# HELP elasticsearch_snapshot_stats_snapshot_number_of_indices Number of indices in the last snapshot
 						# TYPE elasticsearch_snapshot_stats_snapshot_number_of_indices gauge
 						elasticsearch_snapshot_stats_snapshot_number_of_indices{repository="test1",state="SUCCESS",version="2.4.5"} 2
+						# HELP elasticsearch_snapshot_stats_snapshot_size_bytes Total size of each snapshot in bytes
+						# TYPE elasticsearch_snapshot_stats_snapshot_size_bytes gauge
+						elasticsearch_snapshot_stats_snapshot_size_bytes{repository="test1",snapshot="snapshot_1"} 6024
 						# HELP elasticsearch_snapshot_stats_snapshot_start_time_timestamp Last snapshot start timestamp
 						# TYPE elasticsearch_snapshot_stats_snapshot_start_time_timestamp gauge
 						elasticsearch_snapshot_stats_snapshot_start_time_timestamp{repository="test1",state="SUCCESS",version="2.4.5"} 1.536053125e+09
@@ -140,6 +146,9 @@ func TestSnapshots(t *testing.T) {
 						# HELP elasticsearch_snapshot_stats_snapshot_number_of_indices Number of indices in the last snapshot
 						# TYPE elasticsearch_snapshot_stats_snapshot_number_of_indices gauge
 						elasticsearch_snapshot_stats_snapshot_number_of_indices{repository="test1",state="SUCCESS",version="5.4.2"} 2
+						# HELP elasticsearch_snapshot_stats_snapshot_size_bytes Total size of each snapshot in bytes
+						# TYPE elasticsearch_snapshot_stats_snapshot_size_bytes gauge
+						elasticsearch_snapshot_stats_snapshot_size_bytes{repository="test1",snapshot="snapshot_1"} 6024
 						# HELP elasticsearch_snapshot_stats_snapshot_start_time_timestamp Last snapshot start timestamp
 						# TYPE elasticsearch_snapshot_stats_snapshot_start_time_timestamp gauge
 						elasticsearch_snapshot_stats_snapshot_start_time_timestamp{repository="test1",state="SUCCESS",version="5.4.2"} 1.536053353e+09
@@ -175,6 +184,9 @@ func TestSnapshots(t *testing.T) {
 						# HELP elasticsearch_snapshot_stats_snapshot_number_of_indices Number of indices in the last snapshot
 						# TYPE elasticsearch_snapshot_stats_snapshot_number_of_indices gauge
 						elasticsearch_snapshot_stats_snapshot_number_of_indices{repository="test1",state="SUCCESS",version="5.4.2"} 2
+						# HELP elasticsearch_snapshot_stats_snapshot_size_bytes Total size of each snapshot in bytes
+						# TYPE elasticsearch_snapshot_stats_snapshot_size_bytes gauge
+						elasticsearch_snapshot_stats_snapshot_size_bytes{repository="test1",snapshot="snapshot_1"} 6024
 						# HELP elasticsearch_snapshot_stats_snapshot_start_time_timestamp Last snapshot start timestamp
 						# TYPE elasticsearch_snapshot_stats_snapshot_start_time_timestamp gauge
 						elasticsearch_snapshot_stats_snapshot_start_time_timestamp{repository="test1",state="SUCCESS",version="5.4.2"} 1.536053353e+09
@@ -200,6 +212,10 @@ func TestSnapshots(t *testing.T) {
 					fmt.Fprint(w, `{"test1":{"type":"fs","settings":{"location":"/tmp/test1"}}}`)
 					return
 				}
+				if strings.Contains(r.URL.Path, "/_status") {
+					fmt.Fprint(w, `{"snapshots":[{"snapshot":"snapshot_1","stats":{"total":{"size_in_bytes":6024}}}]}`)
+					return
+				}
 				io.Copy(w, f)
 			}))
 			defer ts.Close()
@@ -218,5 +234,117 @@ func TestSnapshots(t *testing.T) {
 				t.Fatal(err)
 			}
 		})
+	}
+}
+
+func TestSnapshotSizePerSnapshot(t *testing.T) {
+	const (
+		repos = `{"repo_a":{"type":"fs","settings":{"location":"/tmp/repo_a"}}}`
+		snaps = `{"snapshots":[
+			{"snapshot":"older","version":"8.11.0","indices":["logs"],"state":"SUCCESS","start_time_in_millis":1536053353971,"end_time_in_millis":1536053354477,"failures":[],"shards":{"total":4,"failed":0,"successful":4}},
+			{"snapshot":"newer","version":"8.11.0","indices":["logs","metrics"],"state":"SUCCESS","start_time_in_millis":1536053400000,"end_time_in_millis":1536053401000,"failures":[],"shards":{"total":6,"failed":0,"successful":6}}
+		]}`
+		status = `{"snapshots":[
+			{"snapshot":"older","stats":{"total":{"size_in_bytes":6024}}},
+			{"snapshot":"newer","stats":{"total":{"size_in_bytes":12048}}}
+		]}`
+		want = `# HELP elasticsearch_snapshot_stats_latest_snapshot_timestamp_seconds Timestamp of the latest SUCCESS or PARTIAL snapshot
+# TYPE elasticsearch_snapshot_stats_latest_snapshot_timestamp_seconds gauge
+elasticsearch_snapshot_stats_latest_snapshot_timestamp_seconds{repository="repo_a"} 1.5360534e+09
+# HELP elasticsearch_snapshot_stats_number_of_snapshots Number of snapshots in a repository
+# TYPE elasticsearch_snapshot_stats_number_of_snapshots gauge
+elasticsearch_snapshot_stats_number_of_snapshots{repository="repo_a"} 2
+# HELP elasticsearch_snapshot_stats_oldest_snapshot_timestamp Timestamp of the oldest snapshot
+# TYPE elasticsearch_snapshot_stats_oldest_snapshot_timestamp gauge
+elasticsearch_snapshot_stats_oldest_snapshot_timestamp{repository="repo_a"} 1.536053353e+09
+# HELP elasticsearch_snapshot_stats_snapshot_end_time_timestamp Last snapshot end timestamp
+# TYPE elasticsearch_snapshot_stats_snapshot_end_time_timestamp gauge
+elasticsearch_snapshot_stats_snapshot_end_time_timestamp{repository="repo_a",state="SUCCESS",version="8.11.0"} 1.536053401e+09
+# HELP elasticsearch_snapshot_stats_snapshot_failed_shards Last snapshot failed shards
+# TYPE elasticsearch_snapshot_stats_snapshot_failed_shards gauge
+elasticsearch_snapshot_stats_snapshot_failed_shards{repository="repo_a",state="SUCCESS",version="8.11.0"} 0
+# HELP elasticsearch_snapshot_stats_snapshot_number_of_failures Last snapshot number of failures
+# TYPE elasticsearch_snapshot_stats_snapshot_number_of_failures gauge
+elasticsearch_snapshot_stats_snapshot_number_of_failures{repository="repo_a",state="SUCCESS",version="8.11.0"} 0
+# HELP elasticsearch_snapshot_stats_snapshot_number_of_indices Number of indices in the last snapshot
+# TYPE elasticsearch_snapshot_stats_snapshot_number_of_indices gauge
+elasticsearch_snapshot_stats_snapshot_number_of_indices{repository="repo_a",state="SUCCESS",version="8.11.0"} 2
+# HELP elasticsearch_snapshot_stats_snapshot_size_bytes Total size of each snapshot in bytes
+# TYPE elasticsearch_snapshot_stats_snapshot_size_bytes gauge
+elasticsearch_snapshot_stats_snapshot_size_bytes{repository="repo_a",snapshot="newer"} 12048
+elasticsearch_snapshot_stats_snapshot_size_bytes{repository="repo_a",snapshot="older"} 6024
+# HELP elasticsearch_snapshot_stats_snapshot_start_time_timestamp Last snapshot start timestamp
+# TYPE elasticsearch_snapshot_stats_snapshot_start_time_timestamp gauge
+elasticsearch_snapshot_stats_snapshot_start_time_timestamp{repository="repo_a",state="SUCCESS",version="8.11.0"} 1.5360534e+09
+# HELP elasticsearch_snapshot_stats_snapshot_successful_shards Last snapshot successful shards
+# TYPE elasticsearch_snapshot_stats_snapshot_successful_shards gauge
+elasticsearch_snapshot_stats_snapshot_successful_shards{repository="repo_a",state="SUCCESS",version="8.11.0"} 6
+# HELP elasticsearch_snapshot_stats_snapshot_total_shards Last snapshot total shards
+# TYPE elasticsearch_snapshot_stats_snapshot_total_shards gauge
+elasticsearch_snapshot_stats_snapshot_total_shards{repository="repo_a",state="SUCCESS",version="8.11.0"} 6
+`
+	)
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/_snapshot":
+			fmt.Fprint(w, repos)
+		case strings.Contains(r.URL.Path, "/_status"):
+			if got, want := r.URL.Query().Get("filter_path"), "snapshots.snapshot,snapshots.stats.total.size_in_bytes"; got != want {
+				t.Errorf("filter_path = %q, want %q", got, want)
+			}
+			fmt.Fprint(w, status)
+		default:
+			fmt.Fprint(w, snaps)
+		}
+	}))
+	defer ts.Close()
+
+	u, err := url.Parse(ts.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c, err := NewSnapshots(promslog.NewNopLogger(), u, http.DefaultClient)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := testutil.CollectAndCompare(wrapCollector{c}, strings.NewReader(want)); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestSnapshotSizeStatusFailureKeepsOtherMetrics(t *testing.T) {
+	body, err := os.ReadFile("../fixtures/snapshots/5.4.2.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.RequestURI == "/_snapshot" {
+			fmt.Fprint(w, `{"test1":{"type":"fs","settings":{"location":"/tmp/test1"}}}`)
+			return
+		}
+		if strings.Contains(r.URL.Path, "/_status") {
+			http.Error(w, "status unavailable", http.StatusInternalServerError)
+			return
+		}
+		w.Write(body)
+	}))
+	defer ts.Close()
+
+	u, err := url.Parse(ts.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c, err := NewSnapshots(promslog.NewNopLogger(), u, http.DefaultClient)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if got := testutil.CollectAndCount(wrapCollector{c}, "elasticsearch_snapshot_stats_snapshot_size_bytes"); got != 0 {
+		t.Fatalf("size metrics = %d, want 0 when status fetch fails", got)
+	}
+	if got := testutil.CollectAndCount(wrapCollector{c}, "elasticsearch_snapshot_stats_number_of_snapshots"); got != 1 {
+		t.Fatalf("number_of_snapshots = %d, want 1 when status fetch fails", got)
 	}
 }

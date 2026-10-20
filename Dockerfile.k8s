@@ -1,0 +1,26 @@
+# syntax=docker/dockerfile:1
+# Jenkins (simpleDocker / buildx) builds this file. The upstream Dockerfile copies a
+# promu binary from .build/ and cannot compile on the docker agent.
+ARG TARGETARCH
+FROM --platform=$BUILDPLATFORM golang:1.23-alpine AS builder
+
+ARG TARGETOS
+ARG TARGETARCH
+
+WORKDIR /src
+
+COPY go.mod go.sum ./
+RUN go mod download
+
+COPY . .
+
+RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} \
+    go build -buildvcs=false -ldflags="-s -w" -o /out/elasticsearch_exporter .
+
+FROM quay.io/prometheus/busybox-linux-${TARGETARCH}:glibc
+
+COPY --from=builder /out/elasticsearch_exporter /bin/elasticsearch_exporter
+
+EXPOSE 7979
+USER nobody
+ENTRYPOINT ["/bin/elasticsearch_exporter"]
