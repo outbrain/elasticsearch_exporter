@@ -11,7 +11,7 @@ simpleDocker([
   prodBranch: 'master',
   dockerfilePath: 'Dockerfile.k8s',
   buildContext: '.',
-  version: 'v1.6.70',
+  version: 'v1.6.71',
   platforms: 'linux/amd64,linux/arm64',
   buildResources: [memory: '4Gi', cpu: '2', ephemeralStorage: '10Gi'],
   buildTarget: 'aws',
