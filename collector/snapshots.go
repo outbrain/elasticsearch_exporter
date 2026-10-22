@@ -292,11 +292,14 @@ func (c *Snapshots) snapshotSizes(ctx context.Context, repository string, snapsh
 		status, err := c.snapshotStatus(ctx, repository, missing[start:end])
 		if err != nil {
 			fetchErr = err
-			break
+			continue
 		}
 		for _, snap := range status.Snapshots {
 			sizes[snap.Snapshot] = snap.Stats.Total.SizeInBytes
-			if snap.State != "IN_PROGRESS" && snap.State != "STARTED" {
+			// Only terminal states are cached. INIT, STARTED, QUEUED and anything
+			// unrecognized are read again next scrape, so a size of 0 cannot stick.
+			switch snap.State {
+			case "SUCCESS", "PARTIAL", "FAILED", "ABORTED":
 				finished[snap.Snapshot] = snap.Stats.Total.SizeInBytes
 			}
 		}

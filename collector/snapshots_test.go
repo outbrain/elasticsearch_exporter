@@ -314,11 +314,13 @@ elasticsearch_snapshot_stats_snapshot_total_shards{repository="repo_a",state="SU
 // fakeSnapshotStatus mimics GET /_snapshot/{repo}/{names}/_status. Like Elasticsearch,
 // _all returns only running snapshots, so finished ones are visible only by name.
 type fakeSnapshotStatus struct {
-	t       *testing.T
-	repo    string
-	sizes   map[string]int64
-	running map[string]bool
-	calls   [][]string
+	t           *testing.T
+	repo        string
+	sizes       map[string]int64
+	running     map[string]bool
+	state       map[string]string
+	calls       [][]string
+	failBatches int
 }
 
 func (f *fakeSnapshotStatus) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -328,6 +330,11 @@ func (f *fakeSnapshotStatus) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	parts := strings.Split(strings.TrimPrefix(r.URL.Path, "/_snapshot/"+f.repo+"/"), "/")
 	names := strings.Split(parts[0], ",")
 	f.calls = append(f.calls, names)
+	if f.failBatches > 0 {
+		f.failBatches--
+		http.Error(w, "status unavailable", http.StatusInternalServerError)
+		return
+	}
 
 	var entries []string
 	for _, name := range names {
@@ -350,6 +357,9 @@ func (f *fakeSnapshotStatus) entry(name string) string {
 	state := "SUCCESS"
 	if f.running[name] {
 		state = "STARTED"
+	}
+	if s, ok := f.state[name]; ok {
+		state = s
 	}
 	return fmt.Sprintf(`{"snapshot":%q,"state":%q,"stats":{"total":{"size_in_bytes":%d}}}`, name, state, f.sizes[name])
 }
@@ -434,6 +444,13 @@ func TestSnapshotSizeCachesFinishedSnapshots(t *testing.T) {
 	if len(es.calls) != 0 {
 		t.Fatalf("fourth scrape status calls = %v, want none once every snapshot is finished", es.calls)
 	}
+
+	es.calls = nil
+	listed = list("done")
+	collect()
+	if got := fmt.Sprint(es.calls); got != "[[done]]" {
+		t.Fatalf("relisting a dropped snapshot status calls = %s, want [[done]]", got)
+	}
 }
 
 func TestSnapshotSizeBatchesNames(t *testing.T) {
@@ -469,6 +486,133 @@ func TestSnapshotSizeBatchesNames(t *testing.T) {
 	}
 	if len(es.calls) != 2 || len(es.calls[0]) != snapshotStatusBatchSize || len(es.calls[1]) != 5 {
 		t.Fatalf("status batches = %d calls %v, want one of %d and one of 5", len(es.calls), es.calls, snapshotStatusBatchSize)
+	}
+}
+
+func TestSnapshotSizeCachesOnlyTerminalStates(t *testing.T) {
+	es := &fakeSnapshotStatus{
+		t:     t,
+		repo:  "repo_a",
+		sizes: map[string]int64{"init": 0, "aborted": 9},
+		state: map[string]string{"init": "INIT", "aborted": "ABORTED"},
+	}
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/_snapshot":
+			fmt.Fprint(w, `{"repo_a":{"type":"fs","settings":{"location":"/tmp/repo_a"}}}`)
+		case strings.HasSuffix(r.URL.Path, "/_status"):
+			es.ServeHTTP(w, r)
+		default:
+			fmt.Fprint(w, `{"snapshots":[
+				{"snapshot":"init","version":"7.17.26","state":"IN_PROGRESS","indices":["logs"],"start_time_in_millis":1536053353971,"end_time_in_millis":0,"failures":[],"shards":{"total":1,"failed":0,"successful":0}},
+				{"snapshot":"aborted","version":"7.17.26","state":"FAILED","indices":["logs"],"start_time_in_millis":1536053353971,"end_time_in_millis":1536053354477,"failures":[],"shards":{"total":1,"failed":1,"successful":0}}
+			]}`)
+		}
+	}))
+	defer ts.Close()
+
+	u, err := url.Parse(ts.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c, err := NewSnapshots(promslog.NewNopLogger(), u, http.DefaultClient)
+	if err != nil {
+		t.Fatal(err)
+	}
+	collect := func(initSize int64) {
+		t.Helper()
+		if err := testutil.CollectAndCompare(wrapCollector{c}, strings.NewReader(fmt.Sprintf(`
+# HELP elasticsearch_snapshot_stats_snapshot_size_bytes Total size of each snapshot in bytes
+# TYPE elasticsearch_snapshot_stats_snapshot_size_bytes gauge
+elasticsearch_snapshot_stats_snapshot_size_bytes{repository="repo_a",snapshot="aborted"} 9
+elasticsearch_snapshot_stats_snapshot_size_bytes{repository="repo_a",snapshot="init"} %d
+`, initSize)), "elasticsearch_snapshot_stats_snapshot_size_bytes"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	collect(0)
+	es.calls = nil
+	es.sizes["init"] = 4
+	collect(4)
+	if got := fmt.Sprint(es.calls); got != "[[init]]" {
+		t.Fatalf("second scrape status calls = %s, want [[init]]", got)
+	}
+}
+
+func TestSnapshotSizeBatchFailureContinues(t *testing.T) {
+	var listed []string
+	es := &fakeSnapshotStatus{t: t, repo: "repo_a", sizes: map[string]int64{}, failBatches: 1}
+	for i := range snapshotStatusBatchSize + 3 {
+		name := fmt.Sprintf("snap_%02d", i)
+		es.sizes[name] = int64(i + 1)
+		listed = append(listed, fmt.Sprintf(`{"snapshot":%q,"state":"SUCCESS","shards":{}}`, name))
+	}
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/_snapshot":
+			fmt.Fprint(w, `{"repo_a":{"type":"fs","settings":{"location":"/tmp/repo_a"}}}`)
+		case strings.HasSuffix(r.URL.Path, "/_status"):
+			es.ServeHTTP(w, r)
+		default:
+			fmt.Fprint(w, `{"snapshots":[`+strings.Join(listed, ",")+`]}`)
+		}
+	}))
+	defer ts.Close()
+
+	u, err := url.Parse(ts.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c, err := NewSnapshots(promslog.NewNopLogger(), u, http.DefaultClient)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := testutil.CollectAndCount(wrapCollector{c}, "elasticsearch_snapshot_stats_snapshot_size_bytes"); got != 3 {
+		t.Fatalf("size metrics = %d, want the 3 names in the batch that succeeded", got)
+	}
+	if len(es.calls) != 2 || len(es.calls[1]) != 3 {
+		t.Fatalf("status calls = %v, want a failed batch of %d and a following batch of 3", es.calls, snapshotStatusBatchSize)
+	}
+}
+
+func TestSnapshotSizeStatusFailureKeepsCachedSize(t *testing.T) {
+	es := &fakeSnapshotStatus{t: t, repo: "repo_a", sizes: map[string]int64{"done": 100, "fresh": 7}}
+	listed := `{"snapshots":[{"snapshot":"done","version":"7.17.26","indices":["logs"],"state":"SUCCESS","start_time_in_millis":1536053353971,"end_time_in_millis":1536053354477,"failures":[],"shards":{"total":1,"failed":0,"successful":1}}]}`
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/_snapshot":
+			fmt.Fprint(w, `{"repo_a":{"type":"fs","settings":{"location":"/tmp/repo_a"}}}`)
+		case strings.HasSuffix(r.URL.Path, "/_status"):
+			es.ServeHTTP(w, r)
+		default:
+			fmt.Fprint(w, listed)
+		}
+	}))
+	defer ts.Close()
+
+	u, err := url.Parse(ts.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c, err := NewSnapshots(promslog.NewNopLogger(), u, http.DefaultClient)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := testutil.CollectAndCount(wrapCollector{c}, "elasticsearch_snapshot_stats_snapshot_size_bytes"); got != 1 {
+		t.Fatalf("first scrape size metrics = %d, want 1", got)
+	}
+
+	es.failBatches = 1
+	listed = `{"snapshots":[
+		{"snapshot":"done","version":"7.17.26","indices":["logs"],"state":"SUCCESS","start_time_in_millis":1536053353971,"end_time_in_millis":1536053354477,"failures":[],"shards":{"total":1,"failed":0,"successful":1}},
+		{"snapshot":"fresh","version":"7.17.26","indices":["logs"],"state":"SUCCESS","start_time_in_millis":1536053400000,"end_time_in_millis":1536053401000,"failures":[],"shards":{"total":1,"failed":0,"successful":1}}
+	]}`
+	if err := testutil.CollectAndCompare(wrapCollector{c}, strings.NewReader(`
+# HELP elasticsearch_snapshot_stats_snapshot_size_bytes Total size of each snapshot in bytes
+# TYPE elasticsearch_snapshot_stats_snapshot_size_bytes gauge
+elasticsearch_snapshot_stats_snapshot_size_bytes{repository="repo_a",snapshot="done"} 100
+`), "elasticsearch_snapshot_stats_snapshot_size_bytes"); err != nil {
+		t.Fatal(err)
 	}
 }
 
