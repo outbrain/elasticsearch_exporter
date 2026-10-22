@@ -189,6 +189,9 @@ func (c *Snapshots) Update(ctx context.Context, ch chan<- prometheus.Metric) err
 		var ssr SnapshotStatsResponse
 		resp, err := getURL(ctx, c.hc, c.logger, u.String())
 		if err != nil {
+			if snapshotStatusAsync {
+				snapshotSizes[repository] = c.cachedSizes(repository)
+			}
 			continue
 		}
 		err = json.Unmarshal(resp, &ssr)
@@ -205,7 +208,11 @@ func (c *Snapshots) Update(ctx context.Context, ch chan<- prometheus.Metric) err
 		snapshotSizes[repository] = sizes
 	}
 	if snapshotStatusAsync {
-		c.pruneRepos(snapshotsStatsResp)
+		listed := make(map[string]struct{}, len(srr))
+		for repository := range srr {
+			listed[repository] = struct{}{}
+		}
+		c.pruneRepos(listed)
 		c.kick()
 	}
 
@@ -244,15 +251,6 @@ func (c *Snapshots) Update(ctx context.Context, ch chan<- prometheus.Metric) err
 			latest,
 			defaultSnapshotRepositoryLabelValues(repositoryName)...,
 		)
-
-		for name, size := range snapshotSizes[repositoryName] {
-			ch <- prometheus.MustNewConstMetric(
-				snapshotSizeBytes,
-				prometheus.GaugeValue,
-				float64(size),
-				repositoryName, name,
-			)
-		}
 
 		if len(snapshotStats.Snapshots) == 0 {
 			continue
@@ -301,6 +299,17 @@ func (c *Snapshots) Update(ctx context.Context, ch chan<- prometheus.Metric) err
 			float64(lastSnapshot.Shards.Successful),
 			defaultSnapshotLabelValues(repositoryName, lastSnapshot)...,
 		)
+	}
+
+	for repositoryName, sizes := range snapshotSizes {
+		for name, size := range sizes {
+			ch <- prometheus.MustNewConstMetric(
+				snapshotSizeBytes,
+				prometheus.GaugeValue,
+				float64(size),
+				repositoryName, name,
+			)
+		}
 	}
 
 	return nil
@@ -397,7 +406,17 @@ func (c *Snapshots) remember(repository string, snapshots []SnapshotStatDataResp
 	return out
 }
 
-func (c *Snapshots) pruneRepos(seen map[string]SnapshotStatsResponse) {
+func (c *Snapshots) cachedSizes(repository string) map[string]int64 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	out := make(map[string]int64, len(c.sizes[repository]))
+	for name, size := range c.sizes[repository] {
+		out[name] = size
+	}
+	return out
+}
+
+func (c *Snapshots) pruneRepos(seen map[string]struct{}) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	for repo := range c.wanted {

@@ -727,3 +727,74 @@ func TestSnapshotStatusFetchDoesNotBlockScrape(t *testing.T) {
 	}
 	t.Fatal("cached size was not emitted on a later scrape")
 }
+
+func TestSnapshotSizeSurvivesAllFailure(t *testing.T) {
+	snapshotStatusAsync = true
+	t.Cleanup(func() { snapshotStatusAsync = false })
+
+	es := &fakeSnapshotStatus{t: t, repo: "repo_a", sizes: map[string]int64{"done": 100}}
+	failAll := false
+	const listed = `{"snapshots":[{"snapshot":"done","version":"7.17.26","state":"SUCCESS","start_time_in_millis":1536053400000,"end_time_in_millis":1536053401000,"indices":["logs"],"failures":[],"shards":{"total":1,"failed":0,"successful":1}}]}`
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/_snapshot":
+			fmt.Fprint(w, `{"repo_a":{"type":"fs","settings":{"location":"/tmp/repo_a"}}}`)
+		case strings.HasSuffix(r.URL.Path, "/_status"):
+			es.ServeHTTP(w, r)
+		case strings.HasSuffix(r.URL.Path, "/_all"):
+			if failAll {
+				http.Error(w, "unavailable", http.StatusInternalServerError)
+				return
+			}
+			fmt.Fprint(w, listed)
+		default:
+			http.Error(w, "unexpected "+r.URL.Path, http.StatusNotFound)
+		}
+	}))
+	t.Cleanup(ts.Close)
+
+	u, err := url.Parse(ts.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c, err := NewSnapshots(promslog.NewNopLogger(), u, http.DefaultClient)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(c.(*Snapshots).stopStatusFetch)
+
+	waitSize := func() {
+		t.Helper()
+		deadline := time.Now().Add(2 * time.Second)
+		for time.Now().Before(deadline) {
+			if testutil.CollectAndCount(wrapCollector{c}, "elasticsearch_snapshot_stats_snapshot_size_bytes") == 1 {
+				return
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		t.Fatal("size was not cached")
+	}
+	waitSize()
+	if got := fmt.Sprint(es.calls); got != "[[done]]" {
+		t.Fatalf("status calls after cache fill = %s, want [[done]]", got)
+	}
+
+	failAll = true
+	if err := testutil.CollectAndCompare(wrapCollector{c}, strings.NewReader(`
+# HELP elasticsearch_snapshot_stats_snapshot_size_bytes Total size of each snapshot in bytes
+# TYPE elasticsearch_snapshot_stats_snapshot_size_bytes gauge
+elasticsearch_snapshot_stats_snapshot_size_bytes{repository="repo_a",snapshot="done"} 100
+`), "elasticsearch_snapshot_stats_snapshot_size_bytes"); err != nil {
+		t.Fatal(err)
+	}
+	if got := fmt.Sprint(es.calls); got != "[[done]]" {
+		t.Fatalf("status calls while /_all fails = %s, want [[done]]", got)
+	}
+
+	failAll = false
+	es.calls = nil
+	waitSize()
+	if len(es.calls) != 0 {
+		t.Fatalf("status calls after /_all recovered = %v, want none", es.calls)
+	}
+}
