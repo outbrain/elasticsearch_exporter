@@ -21,6 +21,8 @@ import (
 	"net/http"
 	"net/url"
 	"path"
+	"strings"
+	"sync"
 
 	"github.com/prometheus/client_golang/prometheus"
 )
@@ -99,11 +101,19 @@ func init() {
 	registerCollector("snapshots", defaultDisabled, NewSnapshots)
 }
 
+// snapshotStatusBatchSize bounds how many snapshot names go into one status URL.
+const snapshotStatusBatchSize = 20
+
 // Snapshots information struct
 type Snapshots struct {
 	logger *slog.Logger
 	hc     *http.Client
 	u      *url.URL
+
+	// sizes caches finished snapshot sizes by repository and snapshot name. A finished
+	// snapshot never changes size, and its status call reads metadata from the repository.
+	mu    sync.Mutex
+	sizes map[string]map[string]int64
 }
 
 // NewSnapshots defines Snapshots Prometheus metrics
@@ -112,13 +122,14 @@ func NewSnapshots(logger *slog.Logger, u *url.URL, hc *http.Client) (Collector, 
 		logger: logger,
 		u:      u,
 		hc:     hc,
+		sizes:  make(map[string]map[string]int64),
 	}, nil
 }
 
 func (c *Snapshots) Update(ctx context.Context, ch chan<- prometheus.Metric) error {
 	// indices
 	snapshotsStatsResp := make(map[string]SnapshotStatsResponse)
-	snapshotStatuses := make(map[string]SnapshotStatusResponse)
+	snapshotSizes := make(map[string]map[string]int64)
 	u := c.u.ResolveReference(&url.URL{Path: "/_snapshot"})
 
 	var srr SnapshotRepositoriesResponse
@@ -146,16 +157,15 @@ func (c *Snapshots) Update(ctx context.Context, ch chan<- prometheus.Metric) err
 		}
 		snapshotsStatsResp[repository] = ssr
 
-		status, err := c.snapshotStatus(ctx, repository)
+		sizes, err := c.snapshotSizes(ctx, repository, ssr.Snapshots)
 		if err != nil {
 			c.logger.Warn(
 				"failed to fetch snapshot status",
 				"repository", repository,
 				"err", err,
 			)
-			continue
 		}
-		snapshotStatuses[repository] = status
+		snapshotSizes[repository] = sizes
 	}
 
 	// Snapshots stats
@@ -194,12 +204,12 @@ func (c *Snapshots) Update(ctx context.Context, ch chan<- prometheus.Metric) err
 			defaultSnapshotRepositoryLabelValues(repositoryName)...,
 		)
 
-		for _, snap := range snapshotStatuses[repositoryName].Snapshots {
+		for name, size := range snapshotSizes[repositoryName] {
 			ch <- prometheus.MustNewConstMetric(
 				snapshotSizeBytes,
 				prometheus.GaugeValue,
-				float64(snap.Stats.Total.SizeInBytes),
-				repositoryName, snap.Snapshot,
+				float64(size),
+				repositoryName, name,
 			)
 		}
 
@@ -255,15 +265,56 @@ func (c *Snapshots) Update(ctx context.Context, ch chan<- prometheus.Metric) err
 	return nil
 }
 
-// snapshotStatus reads each snapshot's stored size from the snapshot status API.
-// filter_path limits the response to snapshot name and total size. Elasticsearch still
+// snapshotSizes returns the size of every listed snapshot in the repository. Sizes of
+// finished snapshots come from the cache; the rest are read from the status API by name,
+// because /_snapshot/{repo}/_all/_status only reports snapshots that are still running.
+// On a status error it returns the sizes it has, so cached series keep reporting.
+func (c *Snapshots) snapshotSizes(ctx context.Context, repository string, snapshots []SnapshotStatDataResponse) (map[string]int64, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	cached := c.sizes[repository]
+	sizes := make(map[string]int64, len(snapshots))
+	finished := make(map[string]int64, len(snapshots))
+	var missing []string
+	for _, snap := range snapshots {
+		if size, ok := cached[snap.Snapshot]; ok {
+			sizes[snap.Snapshot] = size
+			finished[snap.Snapshot] = size
+			continue
+		}
+		missing = append(missing, snap.Snapshot)
+	}
+
+	var fetchErr error
+	for start := 0; start < len(missing); start += snapshotStatusBatchSize {
+		end := min(start+snapshotStatusBatchSize, len(missing))
+		status, err := c.snapshotStatus(ctx, repository, missing[start:end])
+		if err != nil {
+			fetchErr = err
+			break
+		}
+		for _, snap := range status.Snapshots {
+			sizes[snap.Snapshot] = snap.Stats.Total.SizeInBytes
+			if snap.State != "IN_PROGRESS" && snap.State != "STARTED" {
+				finished[snap.Snapshot] = snap.Stats.Total.SizeInBytes
+			}
+		}
+	}
+
+	c.sizes[repository] = finished
+	return sizes, fetchErr
+}
+
+// snapshotStatus reads the stored size of the named snapshots from the snapshot status API.
+// filter_path limits the response to name, state and total size. Elasticsearch still
 // reads shard metadata in the repository to build that response.
-func (c *Snapshots) snapshotStatus(ctx context.Context, repository string) (SnapshotStatusResponse, error) {
+func (c *Snapshots) snapshotStatus(ctx context.Context, repository string, names []string) (SnapshotStatusResponse, error) {
 	var status SnapshotStatusResponse
 	u := c.u.ResolveReference(&url.URL{
-		Path: path.Join("/_snapshot", repository, "_all", "_status"),
+		Path: path.Join("/_snapshot", repository, strings.Join(names, ","), "_status"),
 		RawQuery: url.Values{
-			"filter_path": []string{"snapshots.snapshot,snapshots.stats.total.size_in_bytes"},
+			"filter_path": []string{"snapshots.snapshot,snapshots.state,snapshots.stats.total.size_in_bytes"},
 		}.Encode(),
 	})
 

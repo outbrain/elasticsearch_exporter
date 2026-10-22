@@ -55,6 +55,7 @@ type SnapshotStatusResponse struct {
 // SnapshotStatus is the status of a single snapshot, including its stored size.
 type SnapshotStatus struct {
 	Snapshot string `json:"snapshot"`
+	State    string `json:"state"`
 	Stats    struct {
 		Total struct {
 			SizeInBytes int64 `json:"size_in_bytes"`
