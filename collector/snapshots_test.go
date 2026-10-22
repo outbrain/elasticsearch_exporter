@@ -798,3 +798,71 @@ elasticsearch_snapshot_stats_snapshot_size_bytes{repository="repo_a",snapshot="d
 		t.Fatalf("status calls after /_all recovered = %v, want none", es.calls)
 	}
 }
+
+func TestSnapshotStatusRetryAndNonTerminal(t *testing.T) {
+	snapshotStatusAsync = true
+	t.Cleanup(func() { snapshotStatusAsync = false })
+
+	es := &fakeSnapshotStatus{
+		t:           t,
+		repo:        "repo_a",
+		sizes:       map[string]int64{"broken": 1, "running": 5},
+		state:       map[string]string{"running": "IN_PROGRESS"},
+		failBatches: 1,
+	}
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/_status") {
+			es.ServeHTTP(w, r)
+			return
+		}
+		http.Error(w, "unexpected "+r.URL.Path, http.StatusNotFound)
+	}))
+	t.Cleanup(ts.Close)
+
+	u, err := url.Parse(ts.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	collector, err := NewSnapshots(promslog.NewNopLogger(), u, http.DefaultClient)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := collector.(*Snapshots)
+	c.stopStatusFetch()
+	c.remember("repo_a", []SnapshotStatDataResponse{
+		{Snapshot: "running", StartTimeInMillis: 1},
+		{Snapshot: "broken", StartTimeInMillis: 2},
+	})
+
+	if !c.fetchNext() || !c.fetchNext() {
+		t.Fatal("expected one status call per snapshot")
+	}
+	if c.fetchNext() {
+		t.Fatal("both snapshots should be waiting to retry")
+	}
+	if got := fmt.Sprint(es.calls); got != "[[broken] [running]]" {
+		t.Fatalf("status calls = %s, want the newer snapshot first, then the in-progress one", got)
+	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if len(c.terminal["repo_a"]) != 0 {
+		t.Fatalf("terminal = %v, want neither snapshot cached as finished", c.terminal["repo_a"])
+	}
+	if _, ok := c.sizes["repo_a"]["broken"]; ok {
+		t.Fatal("failed status call stored a size")
+	}
+	if got := c.sizes["repo_a"]["running"]; got != 5 {
+		t.Fatalf("in-progress size = %d, want 5", got)
+	}
+	for _, name := range []string{"broken", "running"} {
+		until, ok := c.retryAt[snapKey("repo_a", name)]
+		if !ok {
+			t.Fatalf("retryAt[%s] not set", name)
+		}
+		delay := time.Until(until)
+		if delay < snapshotStatusRetry-time.Second || delay > snapshotStatusRetry+time.Second {
+			t.Fatalf("retryAt[%s] in %s, want about %s", name, delay, snapshotStatusRetry)
+		}
+	}
+}
