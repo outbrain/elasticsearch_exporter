@@ -21,11 +21,18 @@ import (
 	"net/url"
 	"os"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/prometheus/common/promslog"
 )
+
+func TestMain(m *testing.M) {
+	snapshotStatusAsync = false
+	os.Exit(m.Run())
+}
 
 func TestSnapshots(t *testing.T) {
 	// Testcases created using:
@@ -419,8 +426,8 @@ func TestSnapshotSizeCachesFinishedSnapshots(t *testing.T) {
 	}
 
 	collect()
-	if got := fmt.Sprint(es.calls); got != "[[done running]]" {
-		t.Fatalf("first scrape status calls = %s, want [[done running]]", got)
+	if got := fmt.Sprint(es.calls); got != "[[done] [running]]" {
+		t.Fatalf("first scrape status calls = %s, want one call per snapshot", got)
 	}
 
 	es.calls = nil
@@ -435,8 +442,8 @@ func TestSnapshotSizeCachesFinishedSnapshots(t *testing.T) {
 	es.sizes["new"] = 7
 	listed = list("running", "new")
 	collect()
-	if got := fmt.Sprint(es.calls); got != "[[running new]]" {
-		t.Fatalf("third scrape status calls = %s, want [[running new]]", got)
+	if got := fmt.Sprint(es.calls); got != "[[running] [new]]" {
+		t.Fatalf("third scrape status calls = %s, want one call per snapshot", got)
 	}
 
 	es.calls = nil
@@ -453,13 +460,14 @@ func TestSnapshotSizeCachesFinishedSnapshots(t *testing.T) {
 	}
 }
 
-func TestSnapshotSizeBatchesNames(t *testing.T) {
+func TestSnapshotSizeOneNamePerRequest(t *testing.T) {
+	const n = 4
 	var listed []string
 	es := &fakeSnapshotStatus{t: t, repo: "repo_a", sizes: map[string]int64{}}
-	for i := range snapshotStatusBatchSize + 5 {
+	for i := range n {
 		name := fmt.Sprintf("snap_%02d", i)
 		es.sizes[name] = int64(i)
-		listed = append(listed, fmt.Sprintf(`{"snapshot":%q,"state":"SUCCESS","shards":{}}`, name))
+		listed = append(listed, fmt.Sprintf(`{"snapshot":%q,"state":"SUCCESS","start_time_in_millis":%d,"shards":{}}`, name, i))
 	}
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch {
@@ -481,11 +489,19 @@ func TestSnapshotSizeBatchesNames(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := testutil.CollectAndCount(wrapCollector{c}, "elasticsearch_snapshot_stats_snapshot_size_bytes"); got != snapshotStatusBatchSize+5 {
-		t.Fatalf("size metrics = %d, want %d", got, snapshotStatusBatchSize+5)
+	if got := testutil.CollectAndCount(wrapCollector{c}, "elasticsearch_snapshot_stats_snapshot_size_bytes"); got != n {
+		t.Fatalf("size metrics = %d, want %d", got, n)
 	}
-	if len(es.calls) != 2 || len(es.calls[0]) != snapshotStatusBatchSize || len(es.calls[1]) != 5 {
-		t.Fatalf("status batches = %d calls %v, want one of %d and one of 5", len(es.calls), es.calls, snapshotStatusBatchSize)
+	if len(es.calls) != n {
+		t.Fatalf("status calls = %d %v, want %d calls of one name", len(es.calls), es.calls, n)
+	}
+	for _, call := range es.calls {
+		if len(call) != 1 {
+			t.Fatalf("status call %v, want one snapshot name", call)
+		}
+	}
+	if es.calls[0][0] != "snap_03" {
+		t.Fatalf("first status call = %s, want the newest snapshot", es.calls[0][0])
 	}
 }
 
@@ -540,9 +556,10 @@ elasticsearch_snapshot_stats_snapshot_size_bytes{repository="repo_a",snapshot="i
 }
 
 func TestSnapshotSizeBatchFailureContinues(t *testing.T) {
+	const n = 4
 	var listed []string
 	es := &fakeSnapshotStatus{t: t, repo: "repo_a", sizes: map[string]int64{}, failBatches: 1}
-	for i := range snapshotStatusBatchSize + 3 {
+	for i := range n {
 		name := fmt.Sprintf("snap_%02d", i)
 		es.sizes[name] = int64(i + 1)
 		listed = append(listed, fmt.Sprintf(`{"snapshot":%q,"state":"SUCCESS","shards":{}}`, name))
@@ -567,11 +584,11 @@ func TestSnapshotSizeBatchFailureContinues(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := testutil.CollectAndCount(wrapCollector{c}, "elasticsearch_snapshot_stats_snapshot_size_bytes"); got != 3 {
-		t.Fatalf("size metrics = %d, want the 3 names in the batch that succeeded", got)
+	if got := testutil.CollectAndCount(wrapCollector{c}, "elasticsearch_snapshot_stats_snapshot_size_bytes"); got != n-1 {
+		t.Fatalf("size metrics = %d, want every snapshot except the one status call that failed", got)
 	}
-	if len(es.calls) != 2 || len(es.calls[1]) != 3 {
-		t.Fatalf("status calls = %v, want a failed batch of %d and a following batch of 3", es.calls, snapshotStatusBatchSize)
+	if len(es.calls) != n {
+		t.Fatalf("status calls = %v, want %d single-snapshot calls", es.calls, n)
 	}
 }
 
@@ -650,4 +667,63 @@ func TestSnapshotSizeStatusFailureKeepsOtherMetrics(t *testing.T) {
 	if got := testutil.CollectAndCount(wrapCollector{c}, "elasticsearch_snapshot_stats_number_of_snapshots"); got != 1 {
 		t.Fatalf("number_of_snapshots = %d, want 1 when status fetch fails", got)
 	}
+}
+
+func TestSnapshotStatusFetchDoesNotBlockScrape(t *testing.T) {
+	snapshotStatusAsync = true
+	t.Cleanup(func() { snapshotStatusAsync = false })
+
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var once sync.Once
+	var releaseOnce sync.Once
+	releaseClose := func() { releaseOnce.Do(func() { close(release) }) }
+	es := &fakeSnapshotStatus{t: t, repo: "repo_a", sizes: map[string]int64{"done": 100}}
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/_snapshot":
+			fmt.Fprint(w, `{"repo_a":{"type":"fs","settings":{"location":"/tmp/repo_a"}}}`)
+		case strings.HasSuffix(r.URL.Path, "/_status"):
+			once.Do(func() { close(started) })
+			<-release
+			es.ServeHTTP(w, r)
+		default:
+			fmt.Fprint(w, `{"snapshots":[{"snapshot":"done","version":"7.17.26","state":"SUCCESS","start_time_in_millis":1536053400000,"end_time_in_millis":1536053401000,"indices":["logs"],"failures":[],"shards":{"total":1,"failed":0,"successful":1}}]}`)
+		}
+	}))
+	t.Cleanup(ts.Close)
+	t.Cleanup(releaseClose)
+
+	u, err := url.Parse(ts.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c, err := NewSnapshots(promslog.NewNopLogger(), u, http.DefaultClient)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(c.(*Snapshots).stopStatusFetch)
+
+	start := time.Now()
+	if got := testutil.CollectAndCount(wrapCollector{c}, "elasticsearch_snapshot_stats_snapshot_size_bytes"); got != 0 {
+		t.Fatalf("first scrape size metrics = %d, want 0 while the status call is still running", got)
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("scrape took %s; the status call blocked it", elapsed)
+	}
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("background status fetch did not start")
+	}
+	releaseClose()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if testutil.CollectAndCount(wrapCollector{c}, "elasticsearch_snapshot_stats_snapshot_size_bytes") == 1 {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("cached size was not emitted on a later scrape")
 }
